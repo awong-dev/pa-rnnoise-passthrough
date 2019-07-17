@@ -1,2 +1,2 @@
-pa-passthrough: pa-passthrough.cc
-	g++ -Wall -O2 -g -o $@ $^ -lportaudio -lrnnoise-nu
+pa-passthrough: pa-passthrough.cc terminal.c
+	g++ -Wall -O2 -g -o $@ $^ -lportaudio -lrnnoise-nu -Wl,-rpath,/usr/local/lib
