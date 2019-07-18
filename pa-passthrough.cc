@@ -16,12 +16,19 @@ extern "C" {
 }
 
 #include "portaudio.h"
+#include "pa_linux_alsa.h"
 #include "terminal.h"
 
 static constexpr const int kNumFrames = 480; // This is how much rnnoise expects. 10ms at 48khz
 static constexpr const int kSampleRate = 48000;
 
-int calls = 0;
+std::atomic_int g_calls{0};
+std::atomic_int g_underflows{0};
+std::atomic_int g_overflows{0};
+std::atomic_int g_pa_input_underflows{0};
+std::atomic_int g_pa_input_overflows{0};
+std::atomic_int g_pa_output_underflows{0};
+std::atomic_int g_pa_output_overflows{0};
 
 struct StreamState {
   StreamState() {
@@ -71,25 +78,35 @@ struct StreamState {
       PaStreamCallbackFlags statusFlags,
       void *userData )
   {
-    calls++;
+    g_calls.fetch_add(1, std::memory_order_relaxed);
+    g_pa_input_underflows.fetch_add((statusFlags & paInputUnderflow) != 0, std::memory_order_relaxed);
+    g_pa_input_overflows.fetch_add((statusFlags & paInputOverflow) != 0, std::memory_order_relaxed);
+    g_pa_output_underflows.fetch_add((statusFlags & paOutputUnderflow) != 0, std::memory_order_relaxed);
+    g_pa_output_overflows.fetch_add((statusFlags & paOutputOverflow) != 0, std::memory_order_relaxed);
+
     /* Cast data passed through stream to our structure. */
     StreamState *state = static_cast<StreamState*>(userData);
     int16_t *out = (int16_t*)outputBuffer;
     int32_t *in  = (int32_t*)inputBuffer; /* Prevent unused variable warning. */
+#if 0
+    for (unsigned int i = 0; i < framesPerBuffer; ++i) {
+      out[i*2] = in[i*2] >> 16;
+      out[i*2 +1] = in[i*2 +1] >> 16;
+    }
+    return 0;
+#endif
 
     for(unsigned int i=0; i<framesPerBuffer; i++ ) {
-      // Mono Downmix.
-      state->mixbuffer[state->mixbuffer_fill] = in[i*2];
-      state->mixbuffer[state->mixbuffer_fill] += in[i*2+1];
-
-      // Signal needs to be downmixed from 32-bit resolution to 16-bit.
-      state->mixbuffer[state->mixbuffer_fill] /= (1 << state->attenuation);
+      // Mono Downmix and attenuate.
+      state->mixbuffer[state->mixbuffer_fill] = ((in[i*2] / 2) + (in[i*2+1] / 2)) >> state->attenuation;
       state->mixbuffer_fill++;
       if (state->mixbuffer_fill == kNumFrames) {
         // Drop if we'd overflow output.
         if ((state->out_fill + kNumFrames) <= kOutQueueMax) {
           rnnoise_process_frame(state->sts, &state->out_queue[state->out_fill], &state->mixbuffer[0]);
           state->out_fill += kNumFrames;
+        } else {
+          g_overflows.fetch_add(1, std::memory_order_relaxed);
         }
         state->mixbuffer_fill = 0;
       }
@@ -98,6 +115,9 @@ struct StreamState {
 
     // We're underflowing output.
     unsigned int frames_to_write = std::min(state->out_fill, framesPerBuffer);
+    if (frames_to_write < framesPerBuffer) {
+      g_underflows++;
+    }
     for (unsigned int i = 0; i < frames_to_write; i++) {
       if (state->out_queue[i] > 0 && state->out_queue[i] > std::numeric_limits<int16_t>::max() - 10) {
 	out[i*2] = std::numeric_limits<int16_t>::max();
@@ -160,6 +180,7 @@ int main(int argc, char* argv[]) {
 
   StreamState stream_state;
   stream_state.Open(2, 0);
+  PaAlsa_EnableRealtimeScheduling(stream_state.stream, 1);
   err = Pa_StartStream(stream_state.stream);
   if( err != paNoError ) {
     fprintf(stderr, "PortAudio stream start error: %s\n", Pa_GetErrorText(err));
@@ -170,11 +191,15 @@ int main(int argc, char* argv[]) {
   fcntl(0, F_SETFL, fcntl(0, F_GETFL) | O_NONBLOCK);
   set_conio_terminal_mode();
 
+  int last_num_calls = g_calls;
   while (1) {
     printf(".");
+    fflush(stdout);
     for (int i = 0; i < 100; ++i) {
       int bytes = read(0, &cmd, 1);
       if (bytes > 0) {
+        printf("\n");
+        fflush(stdout);
         switch (cmd) {
           case '=':
           case '+':
@@ -190,15 +215,24 @@ int main(int argc, char* argv[]) {
 
           case 'q':
           case 'Q':
-            exit(0);
-            break;
+            goto end;
         }
       }
-      Pa_Sleep(50);
+      Pa_Sleep(200);
+      int cur_calls = g_calls;
+      if (last_num_calls == cur_calls) {
+        // Wedged.
+        goto end;
+      }
+      last_num_calls = cur_calls;
     }
   }
+end:
 
-  printf("Terminating after %d calls\n", calls);
+  reset_terminal_mode();
+
+  printf("Terminating after %d calls %d underflows %d overflows, %d pa_input_underflow, %d pa_input_overflow, %d pa_output_underflow, %d pa_output_overflow\n",
+      g_calls.load(), g_underflows.load(), g_overflows.load(), g_pa_input_underflows.load(), g_pa_input_overflows.load(), g_pa_output_underflows.load(), g_pa_output_overflows.load());
   err = Pa_Terminate();
   if( err != paNoError ) {
     printf("PortAudio error: %s\n", Pa_GetErrorText(err));
