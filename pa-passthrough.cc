@@ -3,8 +3,10 @@
 #include <cassert>
 #include <cstring>
 
-#include <unistd.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -155,6 +157,17 @@ struct StreamState {
   std::atomic_int attenuation{kMaxAttenuation};
 };
 
+void try_set_realtime() {
+  int ret;
+  pthread_t this_thread = pthread_self();
+  struct sched_param params = {};
+  params.sched_priority = sched_get_priority_max(SCHED_FIFO);
+  ret = pthread_setschedparam(this_thread, SCHED_FIFO, &params);
+  if (ret != 0) {
+    fprintf(stderr, "Failed to set realtime priority\n");
+  }
+}
+
 int main(int argc, char* argv[]) {
   printf("Starting\n");
 
@@ -181,6 +194,7 @@ int main(int argc, char* argv[]) {
   StreamState stream_state;
   stream_state.Open(2, 0);
   PaAlsa_EnableRealtimeScheduling(stream_state.stream, 1);
+//  try_set_realtime();
   err = Pa_StartStream(stream_state.stream);
   if( err != paNoError ) {
     fprintf(stderr, "PortAudio stream start error: %s\n", Pa_GetErrorText(err));
@@ -192,6 +206,7 @@ int main(int argc, char* argv[]) {
   set_conio_terminal_mode();
 
   int last_num_calls = g_calls;
+  int last_errors = g_pa_output_overflows + g_pa_output_underflows + g_pa_input_underflows + g_pa_input_overflows;
   while (1) {
     printf(".");
     fflush(stdout);
@@ -220,10 +235,12 @@ int main(int argc, char* argv[]) {
       }
       Pa_Sleep(200);
       int cur_calls = g_calls;
-      if (last_num_calls == cur_calls) {
+      int errors = g_pa_output_overflows + g_pa_output_underflows + g_pa_input_underflows + g_pa_input_overflows;
+      if (last_num_calls == cur_calls || (last_errors + 10) < errors) {
         // Wedged.
         goto end;
       }
+      last_errors = errors;
       last_num_calls = cur_calls;
     }
   }
