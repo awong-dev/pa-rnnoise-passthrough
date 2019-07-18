@@ -21,11 +21,10 @@ extern "C" {
 #include "pa_linux_alsa.h"
 #include "terminal.h"
 
-static constexpr const int kNumFrames = 480; // This is how much rnnoise expects. 10ms at 48khz
+static constexpr const unsigned long kNumFrames = 480; // This is how much rnnoise expects. 10ms at 48khz
 static constexpr const int kSampleRate = 48000;
 
 std::atomic_int g_calls{0};
-std::atomic_int g_underflows{0};
 std::atomic_int g_overflows{0};
 std::atomic_int g_pa_input_underflows{0};
 std::atomic_int g_pa_input_overflows{0};
@@ -81,15 +80,23 @@ struct StreamState {
       void *userData )
   {
     g_calls.fetch_add(1, std::memory_order_relaxed);
-    g_pa_input_underflows.fetch_add((statusFlags & paInputUnderflow) != 0, std::memory_order_relaxed);
-    g_pa_input_overflows.fetch_add((statusFlags & paInputOverflow) != 0, std::memory_order_relaxed);
-    g_pa_output_underflows.fetch_add((statusFlags & paOutputUnderflow) != 0, std::memory_order_relaxed);
-    g_pa_output_overflows.fetch_add((statusFlags & paOutputOverflow) != 0, std::memory_order_relaxed);
+    bool input_underflowed = (statusFlags & paInputUnderflow);
+    bool input_overflowed = (statusFlags & paInputOverflow);
+    bool output_underflowed = (statusFlags & paOutputUnderflow);
+    bool output_overflowed = (statusFlags & paOutputOverflow);
+    g_pa_input_underflows.fetch_add(input_underflowed, std::memory_order_relaxed);
+    g_pa_input_overflows.fetch_add(input_overflowed, std::memory_order_relaxed);
+    g_pa_output_underflows.fetch_add(output_underflowed, std::memory_order_relaxed);
+    g_pa_output_overflows.fetch_add(output_overflowed, std::memory_order_relaxed);
+    if (input_underflowed || input_overflowed || output_underflowed || output_overflowed) {
+      return 0;  // Early out to catch up. This will glitch.
+    }
 
     /* Cast data passed through stream to our structure. */
     StreamState *state = static_cast<StreamState*>(userData);
     int16_t *out = (int16_t*)outputBuffer;
     int32_t *in  = (int32_t*)inputBuffer; /* Prevent unused variable warning. */
+    int out_fill = 0;
 #if 0
     for (unsigned int i = 0; i < framesPerBuffer; ++i) {
       out[i*2] = in[i*2] >> 16;
@@ -103,43 +110,29 @@ struct StreamState {
       state->mixbuffer[state->mixbuffer_fill] = ((in[i*2] / 2) + (in[i*2+1] / 2)) >> state->attenuation;
       state->mixbuffer_fill++;
       if (state->mixbuffer_fill == kNumFrames) {
-        // Drop if we'd overflow output.
-        if ((state->out_fill + kNumFrames) <= kOutQueueMax) {
-          rnnoise_process_frame(state->sts, &state->out_queue[state->out_fill], &state->mixbuffer[0]);
-          state->out_fill += kNumFrames;
-        } else {
-          g_overflows.fetch_add(1, std::memory_order_relaxed);
-        }
+	rnnoise_process_frame(state->sts, &state->mixbuffer[0], &state->mixbuffer[0]);
+	int frames_to_render = std::min(kNumFrames, framesPerBuffer - out_fill);
+	if (framesPerBuffer < kNumFrames) {
+	  g_overflows.fetch_add(1, std::memory_order_relaxed);
+	}
+	for (int j = 0; j < frames_to_render; ++j) {
+	  int16_t out_value;
+	  float raw_value = state->mixbuffer[j];
+	  if (raw_value > 0 && raw_value > std::numeric_limits<int16_t>::max() - 10) {
+	    out_value = std::numeric_limits<int16_t>::max();
+	  } else if (raw_value < 0 && raw_value < std::numeric_limits<int16_t>::min() + 10)  {
+	    out_value = std::numeric_limits<int16_t>::min();
+	  } else {
+	    out_value = raw_value;
+	  }
+	  *(out++) = out_value;
+	  *(out++) = out_value;
+	}
+	out_fill += frames_to_render;
         state->mixbuffer_fill = 0;
       }
     }
 
-
-    // We're underflowing output.
-    unsigned int frames_to_write = std::min(state->out_fill, framesPerBuffer);
-    if (frames_to_write < framesPerBuffer) {
-      g_underflows++;
-    }
-    for (unsigned int i = 0; i < frames_to_write; i++) {
-      if (state->out_queue[i] > 0 && state->out_queue[i] > std::numeric_limits<int16_t>::max() - 10) {
-	out[i*2] = std::numeric_limits<int16_t>::max();
-	out[i*2 + 1] = std::numeric_limits<int16_t>::max();
-      } else if (state->out_queue[i] < 0 && state->out_queue[i] < std::numeric_limits<int16_t>::min() + 10)  {
-	out[i*2] = std::numeric_limits<int16_t>::min();
-	out[i*2 + 1] = std::numeric_limits<int16_t>::min();
-      } else {
-	out[i*2] = state->out_queue[i];
-	out[i*2+1] = state->out_queue[i];
-      }
-    }
-
-    // Maintain the output buffer.
-    if (frames_to_write < state->out_fill) {
-      memcpy(state->out_queue, state->out_queue + frames_to_write, state->out_fill - frames_to_write);
-      state->out_fill = state->out_fill - frames_to_write;
-    } else {
-      state->out_fill = 0;
-    }
     return 0;
   }
 
@@ -148,10 +141,6 @@ struct StreamState {
   DenoiseState* sts;
   float mixbuffer[kNumFrames];
   unsigned long mixbuffer_fill = 0;
-
-  static constexpr int kOutQueueMax = kNumFrames * 2;
-  float out_queue[kOutQueueMax];
-  unsigned long out_fill = 0;
 
   static constexpr int kMaxAttenuation = 13 + 1; // 32 -> 16 bit + 1 for extra channel
   std::atomic_int attenuation{kMaxAttenuation};
@@ -194,7 +183,7 @@ int main(int argc, char* argv[]) {
   StreamState stream_state;
   stream_state.Open(2, 0);
   PaAlsa_EnableRealtimeScheduling(stream_state.stream, 1);
-//  try_set_realtime();
+  try_set_realtime();
   err = Pa_StartStream(stream_state.stream);
   if( err != paNoError ) {
     fprintf(stderr, "PortAudio stream start error: %s\n", Pa_GetErrorText(err));
@@ -236,7 +225,7 @@ int main(int argc, char* argv[]) {
       Pa_Sleep(200);
       int cur_calls = g_calls;
       int errors = g_pa_output_overflows + g_pa_output_underflows + g_pa_input_underflows + g_pa_input_overflows;
-      if (last_num_calls == cur_calls || (last_errors + 10) < errors) {
+      if (last_num_calls == cur_calls || (last_errors + 20) < errors) {
         // Wedged.
         goto end;
       }
@@ -248,8 +237,8 @@ end:
 
   reset_terminal_mode();
 
-  printf("Terminating after %d calls %d underflows %d overflows, %d pa_input_underflow, %d pa_input_overflow, %d pa_output_underflow, %d pa_output_overflow\n",
-      g_calls.load(), g_underflows.load(), g_overflows.load(), g_pa_input_underflows.load(), g_pa_input_overflows.load(), g_pa_output_underflows.load(), g_pa_output_overflows.load());
+  printf("Terminating after %d calls %d overflows, %d pa_input_underflow, %d pa_input_overflow, %d pa_output_underflow, %d pa_output_overflow\n",
+      g_calls.load(), g_overflows.load(), g_pa_input_underflows.load(), g_pa_input_overflows.load(), g_pa_output_underflows.load(), g_pa_output_overflows.load());
   err = Pa_Terminate();
   if( err != paNoError ) {
     printf("PortAudio error: %s\n", Pa_GetErrorText(err));
