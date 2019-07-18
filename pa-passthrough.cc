@@ -198,36 +198,33 @@ int main(int argc, char* argv[]) {
   int last_errors = g_pa_output_overflows + g_pa_output_underflows + g_pa_input_underflows + g_pa_input_overflows;
   while (1) {
     printf(".");
-    fflush(stdout);
     for (int i = 0; i < 100; ++i) {
       int bytes = read(0, &cmd, 1);
       if (bytes > 0) {
-        printf("\n");
-        fflush(stdout);
-        switch (cmd) {
-          case '=':
-          case '+':
-            printf("l\n");
-            stream_state.attenuation = std::max(0, stream_state.attenuation - 1);
-            break;
+	switch (cmd) {
+	  case '=':
+	  case '+':
+	    stream_state.attenuation = std::max(0, stream_state.attenuation - 1);
+	    printf("louder -%d\n\r", stream_state.attenuation.load(std::memory_order_relaxed));
+	    break;
 
-          case '_':
-          case '-':
-            printf("q\n");
-            stream_state.attenuation = std::min(17, stream_state.attenuation + 1);
-            break;
+	  case '_':
+	  case '-':
+	    stream_state.attenuation = std::min(17, stream_state.attenuation + 1);
+	    printf("quieter: -%d\n\r", stream_state.attenuation.load(std::memory_order_relaxed));
+	    break;
 
-          case 'q':
-          case 'Q':
-            goto end;
-        }
+	  case 'q':
+	  case 'Q':
+	    goto end;
+	}
       }
+      fflush(stdout);
       Pa_Sleep(200);
       int cur_calls = g_calls;
       int errors = g_pa_output_overflows + g_pa_output_underflows + g_pa_input_underflows + g_pa_input_overflows;
-      if (last_num_calls == cur_calls || (last_errors + 20) < errors) {
-        // Wedged.
-        goto end;
+      if (last_num_calls == cur_calls || (last_errors + 2000) < errors) {
+	printf("wedged\n\r");
       }
       last_errors = errors;
       last_num_calls = cur_calls;
